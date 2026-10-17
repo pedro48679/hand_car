@@ -358,6 +358,7 @@ def run(args):
     candidate_count = 0      # Consecutive frames with same candidate
     last_sent_time  = 0.0    # monotonic time of last serial send
 
+    log.info('Camera feed mode: %s', 'As-Is (Unflipped)' if args.mirror else 'Mirrored / Flipped (Default)')
     log.info('Controller running  --  press Q in preview window to quit')
 
     try:
@@ -366,6 +367,12 @@ def run(args):
             if not ok or frame is None:
                 time.sleep(0.01)
                 continue
+
+            # Mirror flag handling:
+            # - If --mirror is provided: feed is as-is (unflipped).
+            # - If --mirror is NOT provided: feed is flipped horizontally (opposite of current).
+            if not args.mirror:
+                frame = cv2.flip(frame, 1)
 
             # ---- CLASSIFY ------------------------------------------------
             raw_cmd, annotated = classifier.classify(frame)
@@ -473,6 +480,10 @@ def parse_args():
     p.add_argument(
         '--no-serial', action='store_true', default=False,
         help='Dry-run: classify gestures and log commands but do not open serial.',
+    )
+    p.add_argument(
+        '--mirror', action='store_true', default=False,
+        help="Keep camera feed as-is (unflipped). When omitted, feed is flipped horizontally (opposite of current).",
     )
     return p.parse_args()
 
