@@ -38,18 +38,24 @@ int echoPin = 13; //ECHO Pin be connected to D13
 int distance, distance_l, distance_r;
 
 char BLE_val = 'S';
-char current_cmd = 'S';
 
-// ==================== WATCHDOG & SAFETY CONFIG ====================
+// ==================== MOVEMENT STATE CONFIG ====================
+// drive_mode persists ('F' = forward, 'B' = backward, 'S' = stop)
+// until a new drive command or obstacle triggers stop.
+char drive_mode = 'S'; 
+char steer_mode = 'C'; // 'C' = center/straight, 'L' = steer left, 'R' = steer right
+
 unsigned long last_cmd_time = 0;
-const unsigned long WATCHDOG_TIMEOUT_MS = 500; // Auto-stop if no command received for 500ms
+unsigned long last_steer_time = 0;
+const unsigned long STEER_TIMEOUT_MS = 400; // Returns steering to center if no new L/R update
 
-// Front collision failsafe configuration
+// Front collision failsafe configuration (ultrasonic obstacle detection)
 unsigned long last_obstacle_check = 0;
 const unsigned long OBSTACLE_INTERVAL_MS = 60; // Check obstacle every 60ms while moving forward
-const int EMERGENCY_STOP_DIST = 12; // cm: emergency stop distance when moving forward
+const int EMERGENCY_STOP_DIST = 15; // cm: emergency stop distance when moving forward
 
 void execute_command(char cmd);
+void update_motors();
 
 void setup() {
   Serial.begin(9600);//Set baud rate to 9600
@@ -70,7 +76,6 @@ void setup() {
   matrix_display(start01); //display start01 expression pattern
 
   car_Stop(); // Ensure car starts completely stopped
-  last_cmd_time = millis();
 }
 
 void loop() {
@@ -89,49 +94,102 @@ void loop() {
       else if (new_cmd == 'r') new_cmd = 'R';
       else if (new_cmd == 's') new_cmd = 'S';
 
-      // Reset watchdog timer on any valid command
-      last_cmd_time = millis();
-
-      // Only execute state transition if command actually changed
-      if (new_cmd != current_cmd) {
-        // Protect H-bridge when switching directly between Forward and Backward
-        if ((current_cmd == 'F' && new_cmd == 'B') || (current_cmd == 'B' && new_cmd == 'F')) {
-          car_Stop();
-          delay(20);
-        }
-
-        current_cmd = new_cmd;
-        BLE_val = new_cmd;
-        execute_command(current_cmd);
-      }
+      BLE_val = new_cmd;
+      execute_command(new_cmd);
     }
   }
 
-  // 2. Watchdog Failsafe:
-  // If moving (F, B, L, R) and no command was received within WATCHDOG_TIMEOUT_MS, auto-stop
-  if (current_cmd == 'F' || current_cmd == 'B' || current_cmd == 'L' || current_cmd == 'R') {
-    if (millis() - last_cmd_time > WATCHDOG_TIMEOUT_MS) {
-      current_cmd = 'S';
-      BLE_val = 'S';
-      car_Stop();
-      matrix_display(clear);
-      matrix_display(STOP01);
+  // 2. Steer Auto-Center Timeout:
+  // If steering is active (L or R) and no steer update was received in STEER_TIMEOUT_MS,
+  // return steering to center while maintaining current drive_mode (F, B, or S).
+  if (steer_mode != 'C') {
+    if (millis() - last_steer_time > STEER_TIMEOUT_MS) {
+      steer_mode = 'C';
+      update_motors();
     }
   }
 
   // 3. Collision Prevention Failsafe:
   // While driving forward, actively check for immediate obstacles ahead
-  if (current_cmd == 'F') {
+  if (drive_mode == 'F') {
     if (millis() - last_obstacle_check > OBSTACLE_INTERVAL_MS) {
       last_obstacle_check = millis();
       int d = get_distance();
       if (d > 0 && d <= EMERGENCY_STOP_DIST) {
-        current_cmd = 'S';
-        BLE_val = 'S';
-        car_Stop();
-        matrix_display(clear);
-        matrix_display(STOP01);
+        drive_mode = 'S';
+        steer_mode = 'C';
+        update_motors();
       }
+    }
+  }
+}
+
+void update_motors() {
+  int base = speeds;
+  int inner = (int)(base * 0.35); // inner wheels slow down for smooth curvature
+
+  if (drive_mode == 'F') {
+    if (steer_mode == 'L') {
+      // Smooth curve forward-left
+      digitalWrite(left_ctrl, HIGH);
+      analogWrite(left_pwm, 255 - inner);
+      digitalWrite(right_ctrl, HIGH);
+      analogWrite(right_pwm, 255 - base);
+      matrix_display(clear);
+      matrix_display(left);
+    } else if (steer_mode == 'R') {
+      // Smooth curve forward-right
+      digitalWrite(left_ctrl, HIGH);
+      analogWrite(left_pwm, 255 - base);
+      digitalWrite(right_ctrl, HIGH);
+      analogWrite(right_pwm, 255 - inner);
+      matrix_display(clear);
+      matrix_display(right);
+    } else {
+      // Straight forward
+      car_front();
+      matrix_display(clear);
+      matrix_display(front);
+    }
+  } else if (drive_mode == 'B') {
+    if (steer_mode == 'L') {
+      // Smooth curve backward-left
+      digitalWrite(left_ctrl, LOW);
+      analogWrite(left_pwm, inner);
+      digitalWrite(right_ctrl, LOW);
+      analogWrite(right_pwm, base);
+      matrix_display(clear);
+      matrix_display(left);
+    } else if (steer_mode == 'R') {
+      // Smooth curve backward-right
+      digitalWrite(left_ctrl, LOW);
+      analogWrite(left_pwm, base);
+      digitalWrite(right_ctrl, LOW);
+      analogWrite(right_pwm, inner);
+      matrix_display(clear);
+      matrix_display(right);
+    } else {
+      // Straight backward
+      car_back();
+      matrix_display(clear);
+      matrix_display(back);
+    }
+  } else { // drive_mode == 'S' (stopped)
+    if (steer_mode == 'L') {
+      // Stationary spin turn left
+      car_left();
+      matrix_display(clear);
+      matrix_display(left);
+    } else if (steer_mode == 'R') {
+      // Stationary spin turn right
+      car_right();
+      matrix_display(clear);
+      matrix_display(right);
+    } else {
+      // Complete stop
+      car_Stop();
+      matrix_display(clear);
+      matrix_display(STOP01);
     }
   }
 }
@@ -141,72 +199,87 @@ void execute_command(char cmd)
   switch(cmd)
   {
     case 'F' : 
-      car_front(); 
-      matrix_display(clear);
-      matrix_display(front);   
+      if (drive_mode == 'B') {
+        car_Stop();
+        delay(20);
+      }
+      drive_mode = 'F';
+      steer_mode = 'C'; // reset steering to center on new drive command
+      update_motors();
       break;
       
     case 'B' : 
-      car_back(); 
-      matrix_display(clear);
-      matrix_display(back); 
+      if (drive_mode == 'F') {
+        car_Stop();
+        delay(20);
+      }
+      drive_mode = 'B';
+      steer_mode = 'C';
+      update_motors();
+      break;
+
+    case 'S' : 
+      drive_mode = 'S';
+      steer_mode = 'C';
+      update_motors();
       break;
 
     case 'L' : 
-      car_left(); 
-      matrix_display(clear);
-      matrix_display(left); 
+      steer_mode = 'L';
+      last_steer_time = millis();
+      update_motors();
       break;
    
     case 'R' : 
-      car_right();
-      matrix_display(clear);
-      matrix_display(right);  
-      break;
-   
-    case 'S' : 
-      car_Stop();
-      matrix_display(clear);
-      matrix_display(STOP01); 
+      steer_mode = 'R';
+      last_steer_time = millis();
+      update_motors();
       break;
 
     case 'a' : 
-      speeds_a();
-      matrix_display(clear);
-      matrix_display(speed_a); 
-      current_cmd = 'S'; 
+      // Speed up without canceling active drive_mode
+      if (speeds <= 235) speeds += 20;
+      else speeds = 255;
+      update_motors();
       break;
    
     case 'd' : 
-      speeds_d();
-      matrix_display(clear);
-      matrix_display(speed_d); 
-      current_cmd = 'S';
+      // Speed down without canceling active drive_mode
+      if (speeds >= 70) speeds -= 20;
+      else speeds = 50;
+      update_motors();
       break;
 
-    case  'U':  
+    case 'U':  
       follow();  //Receiving ‘U’,enter follow mode
-      current_cmd = 'S';
+      drive_mode = 'S';
+      steer_mode = 'C';
+      update_motors();
       break; 
-    case  'Y':  
+    case 'Y':  
       avoid(); //Receiving ‘Y’,enter obstacle avoidance mode  
-      current_cmd = 'S';
+      drive_mode = 'S';
+      steer_mode = 'C';
+      update_motors();
       break;  
-    case  'G':  
+    case 'G':  
       confinement(); //Receiving ‘G’,enter confinement mode
-      current_cmd = 'S';
+      drive_mode = 'S';
+      steer_mode = 'C';
+      update_motors();
       break;  
-    case  'X':  
+    case 'X':  
       tracking(); //Receiving ‘X’,enter tracking mode
-      current_cmd = 'S';
+      drive_mode = 'S';
+      steer_mode = 'C';
+      update_motors();
       break;
 
     default:
-      car_Stop();
-      current_cmd = 'S';
       break;  
   }
 }
+
 
 void car_front()//define the state of going front
 {
