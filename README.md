@@ -466,4 +466,19 @@ python voice_car.py --no-serial --energy-threshold 250
 | **Acoustic Parsing Engine** | SpeechRecognition API with Preemptive Safety Lexical Interceptor |
 | **Obstacle Protection** | Ultrasonic Ranging (40 kHz) with 25 ms Hardware Timeout Protection |
 | **Fail-Safe Mechanisms** | Host Watchdog (300 ms), Firmware Steering Auto-Center (400 ms), Collision Override (<= 15 cm) |
-| **License** | [Apache License 2.0](LICENSE) |
+
+
+---
+
+## 12. References and Documentation
+
+1. **Google MediaPipe Vision Solutions**:
+   - Google MediaPipe Hand Landmarker: https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker
+   - Google MediaPipe Gesture Recognizer: https://developers.google.com/edge/mediapipe/solutions/vision/gesture_recognizer
+
+2. **Acoustic and Speech Recognition Subsystems**:
+   - SpeechRecognition Python Library: https://github.com/Uberi/speech_recognition
+   - PyPI Distribution: https://pypi.org/project/SpeechRecognition/
+   - Google Speech-to-Text API Documentation: https://cloud.google.com/speech-to-text
+
+
