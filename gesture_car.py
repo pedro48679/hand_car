@@ -32,6 +32,7 @@ import argparse
 import sys
 import time
 import os
+import math
 import urllib.request
 import threading
 import logging
@@ -49,8 +50,7 @@ from mediapipe.tasks.python import vision as mp_vision
 WATCHDOG_INTERVAL_S  = 0.30   # Resend current command every N seconds
                                # so Arduino watchdog (500 ms) never fires
 SMOOTHING_FRAMES     = 4      # Frames a gesture must persist before committing
-TURN_DEAD_ZONE_LEFT  = 0.35   # Wrist X fraction below this  -> L
-TURN_DEAD_ZONE_RIGHT = 0.65   # Wrist X fraction above this  -> R
+TILT_THRESHOLD_DEG   = 40.0   # Hand angle from vertical: <= 45° = F/B, > 45° = L/R
 CAM_WIDTH            = 640
 CAM_HEIGHT           = 480
 SERIAL_BAUD          = 9600   # Must match Arduino Serial.begin()
@@ -214,59 +214,81 @@ class GestureClassifier:
             cv2.circle(annotated, pt, 4, color, -1)
 
         # ------------------------------------------------------------------
-        # Feature A: count extended fingers (Y axis: 0 = top, 1 = bottom)
-        # A finger is 'up' when its tip is ABOVE (smaller Y) its PIP joint.
+        # Feature A: count extended fingers
+        # Uses both orientation-independent Euclidean distance from wrist
+        # and vertical check to ensure robust detection at any angle.
         # ------------------------------------------------------------------
+        def is_extended(tip, pip):
+            dist_tip_sq = (lm[tip].x - lm[0].x)**2 + (lm[tip].y - lm[0].y)**2
+            dist_pip_sq = (lm[pip].x - lm[0].x)**2 + (lm[pip].y - lm[0].y)**2
+            return (dist_tip_sq > dist_pip_sq * 1.05) or (lm[tip].y < lm[pip].y)
+
         fingers_up = sum(
             1 for tip, pip in zip(self._FINGER_TIPS, self._FINGER_PIPS)
-            if lm[tip].y < lm[pip].y
+            if is_extended(tip, pip)
         )
 
         # ------------------------------------------------------------------
-        # Feature B: palm vs back orientation
-        # For a RIGHT hand: thumb tip is to the LEFT  of index knuckle (lm[5])
-        #                   when palm faces camera.
-        # Flip for LEFT hand (mirror image).
+        # Feature B: hand tilt angle (degrees from vertical)
+        # Vector from wrist (lm[0]) to middle knuckle (lm[9]).
+        # - 0°   = pointing straight up
+        # - < 0° = tilted to the left  (-90° is horizontal left)
+        # - > 0° = tilted to the right (+90° is horizontal right)
         # ------------------------------------------------------------------
+        dx_hand = lm[9].x - lm[0].x
+        dy_hand = lm[9].y - lm[0].y
+        tilt_deg = math.degrees(math.atan2(dx_hand, -dy_hand))
+
+        # ------------------------------------------------------------------
+        # Feature C: palm vs back orientation
+        # Calculated via cross-product of palm triangle (Wrist -> Index, Wrist -> Pinky)
+        # ------------------------------------------------------------------
+        v_ax = lm[5].x - lm[0].x
+        v_ay = lm[5].y - lm[0].y
+        v_bx = lm[17].x - lm[0].x
+        v_by = lm[17].y - lm[0].y
+        cross_z = (v_ax * v_by) - (v_ay * v_bx)
+
         if handedness == 'Right':
-            palm_facing_camera = lm[4].x < lm[5].x
+            palm_facing = (cross_z > 0)
         else:
-            palm_facing_camera = lm[4].x > lm[5].x
+            palm_facing = (cross_z < 0)
+
+        facing_label = 'Front (Palm)' if palm_facing else 'Back of Hand'
+
+        # Draw hand state diagnostic info near the wrist
+        info_text = f'{handedness} | Up:{fingers_up} | Tilt:{tilt_deg:+.0f}deg | {facing_label}'
+        wrist_px = (max(10, min(w - 280, int(lm[0].x * w))), min(h - 15, int(lm[0].y * h) + 25))
+        cv2.putText(annotated, info_text, wrist_px,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
 
         # ------------------------------------------------------------------
-        # Feature C: wrist X position (0.0 = left edge, 1.0 = right edge)
-        # NOTE: the camera image is NOT mirrored here -- wrist_x reflects
-        #       actual screen position.  If your stream is mirrored, swap
-        #       the L and R commands below.
-        # ------------------------------------------------------------------
-        wrist_x = lm[0].x
-
-        # ------------------------------------------------------------------
-        # Decision tree
+        # Decision tree:
+        # - Closed hand / fist (<= 1 finger up) -> STOP ('S')
+        # - Open hand (>= 3 fingers up):
+        #     - abs(tilt) <= 45°:
+        #         - Back of open hand   -> FORWARD ('F')
+        #         - Front (palm) open   -> BACKWARD ('B')
+        #     - tilt < -45°:            -> TURN LEFT ('L')
+        #     - tilt > +45°:            -> TURN RIGHT ('R')
+        # - Intermediate / 2 fingers   -> STOP ('S')
         # ------------------------------------------------------------------
         if fingers_up <= 1:
-            # Closed fist or nearly closed -> STOP
             command = 'S'
-
-        elif fingers_up >= 4:
-            # Open hand -- check steering first, then F / B
-            if wrist_x < TURN_DEAD_ZONE_LEFT:
-                command = 'L'
-            elif wrist_x > TURN_DEAD_ZONE_RIGHT:
-                command = 'R'
-            elif palm_facing_camera:
-                command = 'F'    # Palm faces camera -> Forward
+        elif fingers_up >= 3:
+            if abs(tilt_deg) <= TILT_THRESHOLD_DEG:
+                if palm_facing:
+                    command = 'B'    # Front of hand (Palm) -> Backward
+                else:
+                    command = 'F'    # Back of hand -> Forward
+            elif -135.0 <= tilt_deg < -TILT_THRESHOLD_DEG:
+                command = 'L'        # Tilted left > 45° -> Turn Left
+            elif TILT_THRESHOLD_DEG < tilt_deg <= 135.0:
+                command = 'R'        # Tilted right > 45° -> Turn Right
             else:
-                command = 'B'    # Back of hand faces camera -> Backward
-
+                command = 'S'        # Hand pointing downwards -> Stop
         else:
-            # 2-3 fingers up -- treat as directional intent only
-            if wrist_x < TURN_DEAD_ZONE_LEFT:
-                command = 'L'
-            elif wrist_x > TURN_DEAD_ZONE_RIGHT:
-                command = 'R'
-            else:
-                command = 'S'
+            command = 'S'            # Intermediate transition state (e.g. 2 fingers)
 
         return command, annotated
 
@@ -357,8 +379,9 @@ def run(args):
                 candidate_cmd   = raw_cmd
                 candidate_count = 1
 
-            # Only commit once SMOOTHING_FRAMES agree
-            new_cmd = candidate_cmd if candidate_count >= SMOOTHING_FRAMES else committed_cmd
+            # Snappy safety stop: stop commits in 2 frames; F/B use full SMOOTHING_FRAMES
+            required_frames = 2 if candidate_cmd == 'S' else SMOOTHING_FRAMES
+            new_cmd = candidate_cmd if candidate_count >= required_frames else committed_cmd
 
             # ---- SEND TO ARDUINO -----------------------------------------
             now          = time.monotonic()
@@ -374,21 +397,30 @@ def run(args):
 
             # ---- DEBUG OVERLAY -------------------------------------------
             color_map = {
-                'F': (0, 200, 0),
-                'B': (0, 0, 220),
-                'L': (220, 120, 0),
-                'R': (220, 0, 120),
-                'S': (60, 60, 60),
+                'F': (0, 180, 0),      # Green for Forward
+                'B': (0, 100, 220),    # Orange/Red for Backward
+                'L': (220, 140, 0),    # Cyan/Blue for Turn Left
+                'R': (200, 0, 200),    # Magenta/Purple for Turn Right
+                'S': (60, 60, 60),     # Dark Gray for Stop
             }
             h, w = annotated.shape[:2]
-            bar_col = color_map.get(committed_cmd, (180, 180, 180))
+            bar_col = color_map.get(committed_cmd, (120, 120, 120))
             cv2.rectangle(annotated, (0, 0), (w, 54), bar_col, -1)
+
+            action_desc = {
+                'F': 'FORWARD (Back of Hand)',
+                'B': 'BACKWARD (Front / Palm)',
+                'L': 'TURN LEFT (Tilted Left)',
+                'R': 'TURN RIGHT (Tilted Right)',
+                'S': 'STOP (Closed Fist / Idle)',
+            }.get(committed_cmd, 'STOP')
+
             label = (
-                f'CMD: {committed_cmd}  |  raw: {raw_cmd}'
-                f'  |  smooth: {candidate_count}/{SMOOTHING_FRAMES}'
+                f'[{committed_cmd}] {action_desc}  |  '
+                f'raw: {raw_cmd} ({candidate_count}/{required_frames})'
             )
-            cv2.putText(annotated, label, (10, 38),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+            cv2.putText(annotated, label, (10, 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
 
             cv2.imshow('Gesture Car Controller -- press Q to quit', annotated)
             if cv2.waitKey(1) & 0xFF == ord('q'):
