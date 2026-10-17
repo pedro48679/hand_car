@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-voice_car.py  --  Voice-Controlled RC Car with Timed Movements
+CyberRover AI  --  Voice-Controlled RC Car with Timed Movements
 ==============================================================
 
 Pipeline:

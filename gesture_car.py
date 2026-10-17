@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gesture_car.py  --  Hand Gesture RC Car Controller
+CyberRover AI  --  Hand Gesture RC Car Controller
 ===================================================
 
 Pipeline:
