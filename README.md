@@ -9,37 +9,14 @@ The system comprises three physical layers coupled over heterogeneous wireless l
 
 ```mermaid
 flowchart LR
-    subgraph S1["1. Ingestion"]
-        CAM["Camera Node<br/>(IP Cam / RTSP)"]
-        MIC["Microphone<br/>(Audio Stream)"]
-    end
+    CAM["IP Camera (Smartphone)<br/>- Image Sensor<br/>- RTSP / HTTP Server"]
+    
+    PC["Host Computer (PC)<br/>- MediaPipe Hand Landmarker<br/>- Speech Recognition (STT)<br/>- Serial Link Controller (F, B, L, R, S)"]
+    
+    ARDUINO["Arduino (4WD Rover)<br/>- HC-06 Bluetooth Receiver<br/>- ATmega328P Firmware<br/>- L298P Driver + 4x DC Motors"]
 
-    subgraph S2["2. Host Processing Engine (PC)"]
-        direction TB
-        subgraph S2_V["Vision Pipeline"]
-            direction LR
-            CV["OpenCV Queue<br/>(Buffer=1)"] --> MP["MediaPipe Hands<br/>(21 Landmarks)"] --> KIN["Kinematic Classifier<br/>(Vector Rules)"]
-        end
-        subgraph S2_A["Acoustic Pipeline"]
-            direction LR
-            VAD["Energy VAD"] --> STT["Google STT"] --> PULSE["Pulse Dispatcher<br/>(0.5s / 1.0s)"]
-        end
-        COMM["Serial Link Controller<br/>(F, B, L, R, S)"]
-        KIN --> COMM
-        PULSE --> COMM
-    end
-
-    subgraph S3["3. Embedded Microcontroller (Car)"]
-        direction TB
-        BT["HC-06 Module<br/>(UART 9600)"] --> MCU["ATmega328P MCU<br/>(State Machine)"]
-        MCU --> DRV["L298P Driver<br/>(Phase PWM)"] --> MTR["4x DC Motors<br/>(Skid Steer)"]
-        SONAR["HC-SR04 Sonar<br/>(<= 15cm Failsafe)"] -.->|Override| MCU
-        MCU -.-> DISP["8x8 LED Matrix"]
-    end
-
-    CAM -->|"WLAN (RTSP/HTTP)"| CV
-    MIC -->|"PCM Audio"| VAD
-    COMM ==>|"Bluetooth SPP (RFCOMM)"| BT
+    CAM -->|"RTSP / UDP (Port 8080 / 8554)<br/>Video Stream"| PC
+    PC -->|"Bluetooth SPP / RFCOMM (COM Port)<br/>ASCII Commands (9600 baud)"| ARDUINO
 ```
 
 ---
