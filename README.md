@@ -8,32 +8,38 @@
 The system comprises three physical layers coupled over heterogeneous wireless links. Real-time telemetry, spatial vision inference, and voice processing are offloaded to an edge compute host (PC), reducing the embedded microcontroller's workload to deterministic motor actuation, PWM generation, and hardware failsafe monitoring.
 
 ```mermaid
-graph TD
-    subgraph S1["Perception Layer: Ingestion"]
-        CAM["Camera Node (Phone / IP Cam)"] -->|"RTSP/UDP (H.264) or HTTP (MJPEG)"| NET["Local WLAN (802.11ac/ax)"]
-        MIC["Microphone Transducer"] -->|"44.1/48 kHz PCM"| PC_AUDIO["Host Audio Subsystem"]
+flowchart LR
+    subgraph S1["1. Ingestion"]
+        CAM["Camera Node<br/>(IP Cam / RTSP)"]
+        MIC["Microphone<br/>(Audio Stream)"]
     end
 
-    subgraph S2["Host Processing Engine (PC / Edge Workstation)"]
-        NET -->|"O(1) Ring-Buffer Thread"| CV["OpenCV VideoCapture Backend"]
-        CV -->|"RGB Frame Array (640x480 @ 30fps)"| MP["MediaPipe GestureRecognizer Task"]
-        MP -->|"21x 3D Vector Landmarks"| KIN["Kinematic Feature Classifier"]
-        KIN -->|"Filtered Command (F/B/L/R/S)"| COMM["Serial Link Controller"]
-
-        PC_AUDIO -->|"16 kHz Monophonic Audio Chunk"| VAD["Energy-Threshold VAD"]
-        VAD -->|"Acoustic Frame"| STT["Speech-to-Text Pipeline"]
-        STT -->|"Parsed Intent"| PULSE["Pulse Width Timer Dispatcher"]
-        PULSE -->|"Asynchronous Command (F/B/L/R/S)"| COMM
+    subgraph S2["2. Host Processing Engine (PC)"]
+        direction TB
+        subgraph S2_V["Vision Pipeline"]
+            direction LR
+            CV["OpenCV Queue<br/>(Buffer=1)"] --> MP["MediaPipe Hands<br/>(21 Landmarks)"] --> KIN["Kinematic Classifier<br/>(Vector Rules)"]
+        end
+        subgraph S2_A["Acoustic Pipeline"]
+            direction LR
+            VAD["Energy VAD"] --> STT["Google STT"] --> PULSE["Pulse Dispatcher<br/>(0.5s / 1.0s)"]
+        end
+        COMM["Serial Link Controller<br/>(F, B, L, R, S)"]
+        KIN --> COMM
+        PULSE --> COMM
     end
 
-    subgraph S3["Actuation Layer: Embedded Microcontroller"]
-        COMM -->|"Bluetooth Classic 2.0+EDR (SPP / RFCOMM)\n9600-8-N-1"| BT["HC-06 Transceiver (UART RX/TX)"]
-        BT -->|"Byte Stream (ASCII)"| ATMEGA["ATmega328P Microcontroller"]
-        ATMEGA -->|"Timer0/1/2 PWM (Phase-Correct)"| L298P["L298P Dual Full-Bridge Driver"]
-        L298P -->|"High-Current H-Bridge Outputs"| MOTORS["4x Geared DC Motors (Differential Drive)"]
-        ATMEGA -->|"Bit-Banged I2C (A4/A5)"| MATRIX["16x8 LED Dot Matrix"]
-        SONAR["HC-SR04 Ultrasonic (D12/D13)"] -->|"Echo Pulse Width (<= 25ms)"| ATMEGA
+    subgraph S3["3. Embedded Microcontroller (Car)"]
+        direction TB
+        BT["HC-06 Module<br/>(UART 9600)"] --> MCU["ATmega328P MCU<br/>(State Machine)"]
+        MCU --> DRV["L298P Driver<br/>(Phase PWM)"] --> MTR["4x DC Motors<br/>(Skid Steer)"]
+        SONAR["HC-SR04 Sonar<br/>(<= 15cm Failsafe)"] -.->|Override| MCU
+        MCU -.-> DISP["8x8 LED Matrix"]
     end
+
+    CAM -->|"WLAN (RTSP/HTTP)"| CV
+    MIC -->|"PCM Audio"| VAD
+    COMM ==>|"Bluetooth SPP (RFCOMM)"| BT
 ```
 
 ---
