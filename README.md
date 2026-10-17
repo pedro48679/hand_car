@@ -298,7 +298,7 @@ $$\text{Inner Wheel Speed} = V_{\text{inner}} = \lfloor V_{\text{base}} \times 0
    }
    ```
 2. **Ultrasonic Collision Interrupter**: While moving in forward mode (`drive_mode == 'F'`), ranging runs cyclically every 60 ms. If an obstacle appears within 15 cm:
-   $$\text{Distance} = \frac{T_{\text{pulse}} (\mu\text{s})}{58} \le 15\text{ cm} \implies \text{drive\_mode} \leftarrow \text{'S'}, \; \text{steer\_mode} \leftarrow \text{'C'}$$
+   $$\text{Distance} = \frac{T_{\text{pulse}} (\text{us})}{58} \le 15\text{ cm} \implies \mathrm{drive\_mode} \leftarrow \text{'S'}, \; \mathrm{steer\_mode} \leftarrow \text{'C'}$$
    Crucially, `pulseIn(echoPin, HIGH, 25000)` enforces a strict **25 ms watchdog timeout** (~4.3 m acoustic ceiling), preventing the default 1000 ms blocking timeout of the Arduino core from halting motor loop execution.
 
 ---
