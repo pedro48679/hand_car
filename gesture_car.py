@@ -4,34 +4,38 @@ gesture_car.py  --  Hand Gesture RC Car Controller
 ===================================================
 
 Pipeline:
-  [Phone Camera] -> HTTP/MJPEG stream (IP Webcam app, Android)
-  [OpenCV]       -> Threaded reader, always yields the freshest frame
-  [MediaPipe]    -> 21 hand landmarks, lite model (~15 ms/frame on CPU)
-  [Classifier]   -> Maps gesture -> command  F / B / L / R / S
-  [PySerial]     -> Sends 1 ASCII byte over Bluetooth COM port to Arduino
+  [Camera / Stream] -> Threaded reader with macOS camera permission auto-retry
+  [MediaPipe]       -> 21 hand landmarks, lite model (~15 ms/frame on CPU)
+  [Classifier]      -> Euclidean finger extension + Vector tilt angle (-90°..+90°)
+  [BLE / Serial]    -> Transmits commands (F, B, L, R, S) over Bluetooth Low Energy
+                       (BT24 module) or Classic Bluetooth/USB Serial (9600 baud)
 
 Gesture map:
-  Open palm  facing camera  -> F  (Forward)
-  Back of hand facing camera -> B  (Backward)
-  Closed fist (0-1 fingers)  -> S  (Stop)
-  Wrist shifted LEFT         -> L  (Turn left)
-  Wrist shifted RIGHT        -> R  (Turn right)
+  Open hand, back facing camera  -> F  (Forward)  [or Palm with --palm-forward]
+  Open hand, palm facing camera  -> B  (Backward) [or Back with --palm-forward]
+  Closed fist (0-1 fingers)      -> S  (Stop)
+  Hand tilted left (> 40°)       -> L  (Turn left)
+  Hand tilted right (> 40°)      -> R  (Turn right)
 
 Usage:
-  # Full pipeline (phone stream + Arduino):
-  python gesture_car.py --stream http://192.168.1.85:8080/video --port COM5
+  # Default (Webcam + Auto BLE to car BT24 module):
+  python gesture_car.py
 
-  # Test gesture detection only (PC webcam, no Arduino):
+  # Gesture test only (PC webcam, no car connection):
   python gesture_car.py --no-serial
 
-  # Phone stream, no Arduino:
-  python gesture_car.py --stream http://192.168.1.85:8080/video --no-serial
+  # Phone IP webcam stream with BLE car:
+  python gesture_car.py --stream http://192.168.1.85:8080/video
+
+  # Classic Bluetooth COM port / USB cable:
+  python gesture_car.py --port /dev/cu.HC-06
 """
 
 import argparse
 import sys
 import time
 import os
+import math
 import urllib.request
 import threading
 import logging
@@ -47,10 +51,9 @@ from mediapipe.tasks.python import vision as mp_vision
 # CONFIGURATION  (edit these to tune behaviour)
 # ---------------------------------------------------------------------------
 WATCHDOG_INTERVAL_S  = 0.30   # Resend current command every N seconds
-                               # so Arduino watchdog (500 ms) never fires
+                              # so Arduino watchdog (500 ms) never fires
 SMOOTHING_FRAMES     = 4      # Frames a gesture must persist before committing
-TURN_DEAD_ZONE_LEFT  = 0.35   # Wrist X fraction below this  -> L
-TURN_DEAD_ZONE_RIGHT = 0.65   # Wrist X fraction above this  -> R
+TILT_THRESHOLD_DEG   = 40.0   # Hand angle from vertical: <= 40° = F/B, > 40° = L/R
 CAM_WIDTH            = 640
 CAM_HEIGHT           = 480
 SERIAL_BAUD          = 9600   # Must match Arduino Serial.begin()
@@ -69,22 +72,27 @@ log = logging.getLogger('gesture_car')
 
 
 # ===========================================================================
-# STEP 1 -- PHONE CAMERA STREAM
-# Zero-lag threaded MJPEG / RTSP reader.
-# The background thread always reads the latest frame from the buffer,
-# preventing OpenCV's internal queue from accumulating stale frames.
-#
-# Compatible sources:
-#   IP Webcam (Android): http://<ip>:8080/video
-#   DroidCam:            http://<ip>:4747/video
-#   PC webcam:           0   (integer)
+# STEP 1 -- CAMERA STREAM (Webcam / Phone MJPEG)
 # ===========================================================================
 class RealtimeCameraStream:
     def __init__(self, src):
         log.info('Opening stream: %s', src)
         self.cap = cv2.VideoCapture(src)
+
+        # On macOS, initial access requests TCC permission; give it a brief retry window
+        if not self.cap.isOpened() and isinstance(src, int):
+            for _ in range(4):
+                time.sleep(0.5)
+                self.cap = cv2.VideoCapture(src)
+                if self.cap.isOpened():
+                    break
+
         if not self.cap.isOpened():
-            raise RuntimeError(f'Cannot open stream: {src}')
+            raise RuntimeError(
+                f'Cannot open stream: {src}.\n'
+                'Tip: On macOS, ensure Camera permission is granted to your terminal/IDE '
+                '(System Settings > Privacy & Security > Camera), or verify that no other app is using the webcam.'
+            )
 
         # Minimise OpenCV internal buffer to 1 frame -> eliminates built-in lag
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -121,24 +129,10 @@ class RealtimeCameraStream:
 
 # ===========================================================================
 # STEP 2 -- GESTURE CLASSIFIER  (MediaPipe Hands, lite model)
-#
-# Relevant landmark indices (0-indexed, 21 total):
-#   0   WRIST
-#   4   THUMB_TIP
-#   5   INDEX_FINGER_MCP  (knuckle base)
-#   6   INDEX_FINGER_PIP  (middle joint)
-#   8   INDEX_FINGER_TIP
-#   10  MIDDLE_FINGER_PIP
-#   12  MIDDLE_FINGER_TIP
-#   14  RING_FINGER_PIP
-#   16  RING_FINGER_TIP
-#   18  PINKY_PIP
-#   20  PINKY_TIP
 # ===========================================================================
 class GestureClassifier:
-    # Tip / PIP pairs for the four fingers (not thumb)
-    _FINGER_TIPS  = [8,  12, 16, 20]
-    _FINGER_PIPS  = [6,  10, 14, 18]
+    _FINGER_TIPS = [8,  12, 16, 20]
+    _FINGER_PIPS = [6,  10, 14, 18]
 
     # Hand landmark connections for skeleton rendering
     _HAND_CONNECTIONS = [
@@ -151,7 +145,8 @@ class GestureClassifier:
 
     MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task'
 
-    def __init__(self, model_file='gesture_recognizer.task'):
+    def __init__(self, model_file='gesture_recognizer.task', palm_is_forward=False):
+        self.palm_is_forward = palm_is_forward
         script_dir = os.path.dirname(os.path.abspath(__file__))
         target_path = os.path.join(script_dir, model_file)
         if not os.path.exists(target_path):
@@ -165,7 +160,6 @@ class GestureClassifier:
                     out_f.write(resp.read())
                 log.info('Model downloaded successfully.')
 
-        # Read binary buffer to prevent Windows Unicode path issues in C++ Bazel runfiles
         with open(target_path, 'rb') as f:
             model_data = f.read()
 
@@ -189,7 +183,7 @@ class GestureClassifier:
         command : str or None
             'F', 'B', 'L', 'R', 'S' -- or None if no hand detected.
         annotated : np.ndarray
-            Frame with landmark skeleton overlaid.
+            Frame with landmark skeleton and HUD diagnostics overlaid.
         """
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -199,9 +193,9 @@ class GestureClassifier:
         h, w, _ = annotated.shape
 
         if not result.hand_landmarks:
-            return None, annotated       # No hand in frame
+            return None, annotated
 
-        lm = result.hand_landmarks[0]    # list of 21 NormalizedLandmarks (x, y, z all 0-1)
+        lm = result.hand_landmarks[0]
         handedness = result.handedness[0][0].category_name if result.handedness else 'Right'
 
         # Draw skeleton connections
@@ -214,59 +208,79 @@ class GestureClassifier:
             cv2.circle(annotated, pt, 4, color, -1)
 
         # ------------------------------------------------------------------
-        # Feature A: count extended fingers (Y axis: 0 = top, 1 = bottom)
-        # A finger is 'up' when its tip is ABOVE (smaller Y) its PIP joint.
+        # Feature A: count extended fingers using Euclidean distance from wrist
+        # (Orientation-independent check works reliably even when hand is tilted)
         # ------------------------------------------------------------------
+        def is_extended(tip, pip):
+            dist_tip_sq = (lm[tip].x - lm[0].x)**2 + (lm[tip].y - lm[0].y)**2
+            dist_pip_sq = (lm[pip].x - lm[0].x)**2 + (lm[pip].y - lm[0].y)**2
+            return (dist_tip_sq > dist_pip_sq * 1.05) or (lm[tip].y < lm[pip].y)
+
         fingers_up = sum(
             1 for tip, pip in zip(self._FINGER_TIPS, self._FINGER_PIPS)
-            if lm[tip].y < lm[pip].y
+            if is_extended(tip, pip)
         )
 
         # ------------------------------------------------------------------
-        # Feature B: palm vs back orientation
-        # For a RIGHT hand: thumb tip is to the LEFT  of index knuckle (lm[5])
-        #                   when palm faces camera.
-        # Flip for LEFT hand (mirror image).
+        # Feature B: hand tilt angle (degrees from vertical)
+        # Vector from wrist (lm[0]) to middle knuckle (lm[9]):
+        # - 0°   = pointing straight up
+        # - < 0° = tilted to the left  (-90° is horizontal left)
+        # - > 0° = tilted to the right (+90° is horizontal right)
         # ------------------------------------------------------------------
+        dx_hand = lm[9].x - lm[0].x
+        dy_hand = lm[9].y - lm[0].y
+        tilt_deg = math.degrees(math.atan2(dx_hand, -dy_hand))
+
+        # ------------------------------------------------------------------
+        # Feature C: palm vs back of hand orientation
+        # Cross-product of palm triangle (Wrist -> Index MCP, Wrist -> Pinky MCP)
+        # ------------------------------------------------------------------
+        v_ax = lm[5].x - lm[0].x
+        v_ay = lm[5].y - lm[0].y
+        v_bx = lm[17].x - lm[0].x
+        v_by = lm[17].y - lm[0].y
+        cross_z = (v_ax * v_by) - (v_ay * v_bx)
+
         if handedness == 'Right':
-            palm_facing_camera = lm[4].x < lm[5].x
+            palm_facing = (cross_z > 0)
         else:
-            palm_facing_camera = lm[4].x > lm[5].x
+            palm_facing = (cross_z < 0)
+
+        facing_label = 'Front (Palm)' if palm_facing else 'Back of Hand'
+
+        # Draw hand diagnostic HUD near the wrist
+        info_text = f'{handedness} | Up:{fingers_up} | Tilt:{tilt_deg:+.0f}deg | {facing_label}'
+        wrist_px = (max(10, min(w - 280, int(lm[0].x * w))), min(h - 15, int(lm[0].y * h) + 25))
+        cv2.putText(annotated, info_text, wrist_px,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
 
         # ------------------------------------------------------------------
-        # Feature C: wrist X position (0.0 = left edge, 1.0 = right edge)
-        # NOTE: the camera image is NOT mirrored here -- wrist_x reflects
-        #       actual screen position.  If your stream is mirrored, swap
-        #       the L and R commands below.
-        # ------------------------------------------------------------------
-        wrist_x = lm[0].x
-
-        # ------------------------------------------------------------------
-        # Decision tree
+        # Decision tree:
+        # - Closed hand / fist (<= 1 finger up) -> STOP ('S')
+        # - Open hand (>= 3 fingers up):
+        #     - abs(tilt) <= TILT_THRESHOLD_DEG:
+        #         - Forward vs Backward depending on palm / back orientation
+        #     - tilt < -TILT_THRESHOLD_DEG: -> TURN LEFT ('L')
+        #     - tilt > +TILT_THRESHOLD_DEG: -> TURN RIGHT ('R')
+        # - Intermediate state (e.g. 2 fingers) -> STOP ('S')
         # ------------------------------------------------------------------
         if fingers_up <= 1:
-            # Closed fist or nearly closed -> STOP
             command = 'S'
-
-        elif fingers_up >= 4:
-            # Open hand -- check steering first, then F / B
-            if wrist_x < TURN_DEAD_ZONE_LEFT:
-                command = 'L'
-            elif wrist_x > TURN_DEAD_ZONE_RIGHT:
-                command = 'R'
-            elif palm_facing_camera:
-                command = 'F'    # Palm faces camera -> Forward
+        elif fingers_up >= 3:
+            if abs(tilt_deg) <= TILT_THRESHOLD_DEG:
+                if self.palm_is_forward:
+                    command = 'F' if palm_facing else 'B'
+                else:
+                    command = 'B' if palm_facing else 'F'
+            elif -135.0 <= tilt_deg < -TILT_THRESHOLD_DEG:
+                command = 'L'        # Tilted left -> Turn Left
+            elif TILT_THRESHOLD_DEG < tilt_deg <= 135.0:
+                command = 'R'        # Tilted right -> Turn Right
             else:
-                command = 'B'    # Back of hand faces camera -> Backward
-
+                command = 'S'        # Hand pointing downwards -> Stop
         else:
-            # 2-3 fingers up -- treat as directional intent only
-            if wrist_x < TURN_DEAD_ZONE_LEFT:
-                command = 'L'
-            elif wrist_x > TURN_DEAD_ZONE_RIGHT:
-                command = 'R'
-            else:
-                command = 'S'
+            command = 'S'
 
         return command, annotated
 
@@ -275,7 +289,93 @@ class GestureClassifier:
 
 
 # ===========================================================================
-# STEP 3 -- ARDUINO SERIAL SENDER  (Bluetooth virtual COM port)
+# STEP 3A -- ARDUINO BLE SENDER (for BLE modules like Keyestudio BT24 / HM-10)
+# ===========================================================================
+class ArduinoBleSender:
+    def __init__(self, target_name='BT24', char_uuid='0000ffe1-0000-1000-8000-00805f9b34fb', dry_run=False):
+        self._dry_run = dry_run
+        if dry_run:
+            log.info('DRY-RUN mode: no BLE connection will be opened')
+            return
+
+        import asyncio
+        import queue
+        from bleak import BleakClient, BleakScanner
+
+        self._queue = queue.Queue(maxsize=10)
+        self._connected = threading.Event()
+        self._stopped = threading.Event()
+        self._char_uuid = char_uuid
+        self._target_name = target_name
+
+        def _worker():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            async def _main():
+                log.info('Scanning for BLE device: %s ...', self._target_name)
+                device = await BleakScanner.find_device_by_name(self._target_name, timeout=6.0)
+                if not device:
+                    log.info('Device "%s" not found by name, scanning for transparent UART service...', self._target_name)
+                    found = await BleakScanner.discover(timeout=4.0, service_uuids=['0000ffe0-0000-1000-8000-00805f9b34fb'])
+                    if found:
+                        device = found[0]
+
+                if not device:
+                    log.error('Could not find BLE device "%s". Is the car powered ON?', self._target_name)
+                    return
+
+                log.info('Found %s (%s). Connecting...', getattr(device, 'name', self._target_name), device.address)
+                async with BleakClient(device) as client:
+                    log.info('Connected to car over BLE! Car LED should be solid.')
+                    self._connected.set()
+                    while not self._stopped.is_set():
+                        try:
+                            cmd = self._queue.get(timeout=0.04)
+                            while not self._queue.empty():
+                                cmd = self._queue.get_nowait()
+                            await client.write_gatt_char(self._char_uuid, cmd.encode('ascii'), response=False)
+                        except queue.Empty:
+                            pass
+                        except Exception as w_err:
+                            log.warning('BLE write error: %s', w_err)
+
+                    try:
+                        await client.write_gatt_char(self._char_uuid, b'S', response=False)
+                    except Exception:
+                        pass
+                log.info('BLE connection closed.')
+
+            try:
+                loop.run_until_complete(_main())
+            except Exception as e:
+                log.error('BLE error: %s', e)
+
+        self._thread = threading.Thread(target=_worker, daemon=True)
+        self._thread.start()
+
+        if not self._connected.wait(timeout=10.0):
+            log.error('Failed to connect to BLE device "%s" within 10s.', self._target_name)
+            log.error('Ensure car switch is ON and battery is charged.')
+            sys.exit(1)
+
+    def send(self, cmd: str):
+        if self._dry_run:
+            return
+        try:
+            self._queue.put_nowait(cmd)
+        except Exception:
+            pass
+
+    def close(self):
+        if self._dry_run:
+            return
+        self._stopped.set()
+        self._thread.join(timeout=2.0)
+
+
+# ===========================================================================
+# STEP 3B -- ARDUINO SERIAL SENDER (Classic Bluetooth COM port / USB)
 # ===========================================================================
 class ArduinoSender:
     def __init__(self, port, baud, dry_run=False):
@@ -294,7 +394,6 @@ class ArduinoSender:
             sys.exit(1)
 
     def send(self, cmd: str):
-        """Transmit one ASCII command character to the Arduino."""
         if self._dry_run:
             return
         if self._ser and self._ser.is_open:
@@ -321,20 +420,28 @@ def run(args):
     time.sleep(0.5)    # Let background thread fill the first frame
 
     # -- Step 2: init classifier
-    classifier = GestureClassifier()
+    classifier = GestureClassifier(palm_is_forward=args.palm_forward)
 
     # -- Step 3: init sender
-    sender = ArduinoSender(
-        port    = args.port or 'COM_PLACEHOLDER',
-        baud    = SERIAL_BAUD,
-        dry_run = args.no_serial,
-    )
+    if args.no_serial:
+        sender = ArduinoSender(port=None, baud=SERIAL_BAUD, dry_run=True)
+    elif args.ble or args.port is None or ('Bluetooth-Incoming-Port' in (args.port or '')):
+        if args.port and 'Bluetooth-Incoming-Port' in args.port:
+            log.warning("Notice: '%s' is a macOS internal port, not the car.", args.port)
+            log.info("Auto-connecting to car via BLE (device: %s)...", args.ble_name)
+        sender = ArduinoBleSender(target_name=args.ble_name)
+    else:
+        sender = ArduinoSender(
+            port    = args.port,
+            baud    = SERIAL_BAUD,
+            dry_run = False,
+        )
 
     # -- State machine
     committed_cmd   = 'S'    # Last command actually sent to Arduino
     candidate_cmd   = 'S'    # Current raw gesture candidate
     candidate_count = 0      # Consecutive frames with same candidate
-    last_sent_time  = 0.0    # monotonic time of last serial send
+    last_sent_time  = 0.0    # monotonic time of last send
 
     log.info('Controller running  --  press Q in preview window to quit')
 
@@ -357,8 +464,9 @@ def run(args):
                 candidate_cmd   = raw_cmd
                 candidate_count = 1
 
-            # Only commit once SMOOTHING_FRAMES agree
-            new_cmd = candidate_cmd if candidate_count >= SMOOTHING_FRAMES else committed_cmd
+            # Snappy safety stop: stop commits in 2 frames; F/B/L/R use full SMOOTHING_FRAMES
+            required_frames = 2 if candidate_cmd == 'S' else SMOOTHING_FRAMES
+            new_cmd = candidate_cmd if candidate_count >= required_frames else committed_cmd
 
             # ---- SEND TO ARDUINO -----------------------------------------
             now          = time.monotonic()
@@ -374,21 +482,37 @@ def run(args):
 
             # ---- DEBUG OVERLAY -------------------------------------------
             color_map = {
-                'F': (0, 200, 0),
-                'B': (0, 0, 220),
-                'L': (220, 120, 0),
-                'R': (220, 0, 120),
-                'S': (60, 60, 60),
+                'F': (0, 180, 0),      # Green for Forward
+                'B': (0, 100, 220),    # Orange/Red for Backward
+                'L': (220, 140, 0),    # Cyan/Blue for Turn Left
+                'R': (200, 0, 200),    # Magenta/Purple for Turn Right
+                'S': (60, 60, 60),     # Dark Gray for Stop
             }
             h, w = annotated.shape[:2]
-            bar_col = color_map.get(committed_cmd, (180, 180, 180))
+            bar_col = color_map.get(committed_cmd, (120, 120, 120))
             cv2.rectangle(annotated, (0, 0), (w, 54), bar_col, -1)
+
+            if args.palm_forward:
+                forward_hint = 'Palm'
+                backward_hint = 'Back of Hand'
+            else:
+                forward_hint = 'Back of Hand'
+                backward_hint = 'Palm'
+
+            action_desc = {
+                'F': f'FORWARD ({forward_hint})',
+                'B': f'BACKWARD ({backward_hint})',
+                'L': 'TURN LEFT (Tilted Left)',
+                'R': 'TURN RIGHT (Tilted Right)',
+                'S': 'STOP (Closed Fist / Idle)',
+            }.get(committed_cmd, 'STOP')
+
             label = (
-                f'CMD: {committed_cmd}  |  raw: {raw_cmd}'
-                f'  |  smooth: {candidate_count}/{SMOOTHING_FRAMES}'
+                f'[{committed_cmd}] {action_desc}  |  '
+                f'raw: {raw_cmd} ({candidate_count}/{required_frames})'
             )
-            cv2.putText(annotated, label, (10, 38),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+            cv2.putText(annotated, label, (10, 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
 
             cv2.imshow('Gesture Car Controller -- press Q to quit', annotated)
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -416,14 +540,17 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Examples:\n'
-            '  # Full pipeline (phone + Arduino):\n'
-            '  python gesture_car.py --stream http://192.168.1.85:8080/video --port COM5\n'
+            '  # Default (Webcam + Auto BLE to BT24):\n'
+            '  python gesture_car.py\n'
             '\n'
-            '  # Gesture test only (PC webcam, no Arduino):\n'
+            '  # Test gestures without Arduino/car:\n'
             '  python gesture_car.py --no-serial\n'
             '\n'
-            '  # Phone stream, no Arduino:\n'
-            '  python gesture_car.py --stream http://192.168.1.85:8080/video --no-serial\n'
+            '  # Phone stream, with BLE car:\n'
+            '  python gesture_car.py --stream http://192.168.1.85:8080/video\n'
+            '\n'
+            '  # Classic Bluetooth port or USB cable:\n'
+            '  python gesture_car.py --port /dev/cu.HC-06\n'
         ),
     )
     p.add_argument(
@@ -435,20 +562,28 @@ def parse_args():
         ),
     )
     p.add_argument(
+        '--ble', action='store_true', default=False,
+        help='Connect directly to Bluetooth Low Energy (BLE) module (e.g. BT24 / HM-10).',
+    )
+    p.add_argument(
+        '--ble-name', default='BT24',
+        help='Target BLE device name (default: BT24).',
+    )
+    p.add_argument(
         '--port', default=None,
-        help='Bluetooth COM port (e.g. COM5 on Windows, /dev/rfcomm0 on Linux/Mac).',
+        help='Classic Bluetooth or USB COM port (e.g. COM5, /dev/cu.HC-06).',
+    )
+    p.add_argument(
+        '--palm-forward', action='store_true', default=False,
+        help='Use open palm for Forward and back of hand for Backward (default is back for Forward).',
     )
     p.add_argument(
         '--no-serial', action='store_true', default=False,
-        help='Dry-run: classify gestures and log commands but do not open serial.',
+        help='Dry-run: classify gestures and log commands but do not connect to Arduino.',
     )
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
-    if not args.no_serial and args.port is None:
-        print('ERROR: provide --port COMx or use --no-serial for testing.')
-        print('Run: python gesture_car.py --help')
-        sys.exit(1)
     run(args)
